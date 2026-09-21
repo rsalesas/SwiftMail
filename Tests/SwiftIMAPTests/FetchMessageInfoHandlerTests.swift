@@ -134,6 +134,31 @@ struct FetchMessageInfoHandlerTests {
         #expect(infos[0].additionalFields?["references"] == nil)
     }
 
+    @Test
+    func testReplyToIsKeptInAdditionalFields() async throws {
+        let headerBlock = """
+        Reply-To: "Support Desk" <desk@example.com>,\r
+         other@example.com\r
+        Subject: Hello\r
+        \r
+        """
+
+        let infos = try await executeFetch(
+            [
+                fetchResponse(
+                    sequenceNumber: 1,
+                    envelope: envelopeAttribute(messageId: "<msg@example.com>"),
+                    headerBlock: headerBlock
+                ),
+                "A001 OK FETCH completed\r\n",
+            ]
+        )
+
+        #expect(infos.count == 1)
+        #expect(infos[0].additionalFields?["reply-to"] == "\"Support Desk\" <desk@example.com>, other@example.com")
+        #expect(infos[0].additionalFields?["subject"] == nil)
+    }
+
     private func executeFetch(_ rawResponses: [String]) async throws -> [MessageInfo] {
         let channel = NIOAsyncTestingChannel()
 
