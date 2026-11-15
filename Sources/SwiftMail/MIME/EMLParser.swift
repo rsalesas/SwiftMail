@@ -34,12 +34,12 @@ public struct EMLParser {
     /// - Parameter data: Raw RFC 822 bytes (as obtained from `fetchRawMessage` or an `.eml` file).
     /// - Returns: A fully populated ``Message``.
     public static func parse(_ data: Data) throws -> Message {
-        guard let string = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .ascii) else {
+        guard !data.isEmpty else {
             throw EMLParserError.invalidData
         }
 
         // Split headers and body at the first blank line
-        let (headerBlock, bodyData) = splitHeadersAndBody(from: string, rawData: data)
+        let (headerBlock, bodyData) = splitHeadersAndBody(data)
 
         guard !headerBlock.isEmpty else {
             throw EMLParserError.missingHeaders
@@ -63,23 +63,66 @@ public struct EMLParser {
 
     // MARK: - Header Parsing
 
-    /// Split the raw message into header block (String) and body (Data).
-    private static func splitHeadersAndBody(from string: String, rawData: Data) -> (String, Data) {
-        // Find the blank line separator — try \r\n\r\n first, then \n\n
-        if let range = string.range(of: "\r\n\r\n") {
-            let headerBlock = String(string[string.startIndex..<range.lowerBound])
-            let bodyStart = string.distance(from: string.startIndex, to: range.upperBound)
-            let bodyData = rawData.dropFirst(bodyStart)
-            return (headerBlock, Data(bodyData))
-        } else if let range = string.range(of: "\n\n") {
-            let headerBlock = String(string[string.startIndex..<range.lowerBound])
-            let bodyStart = string.distance(from: string.startIndex, to: range.upperBound)
-            let bodyData = rawData.dropFirst(bodyStart)
-            return (headerBlock, Data(bodyData))
+    /// Split a raw entity into its header block and its body, at the first
+    /// empty line.
+    ///
+    /// Works on bytes throughout. Finding the separator in a `String` and then
+    /// cutting the `Data` at `string.distance(...)` mixed two units: Swift
+    /// counts `"\r\n"` as one Character, so in a CRLF message (every message
+    /// a mail server hands out) each header line moved the cut one byte early,
+    /// and the body began inside the headers. Non-UTF-8 bodies (8bit Latin-1,
+    /// binary parts) also made the whole message unparseable, since the body
+    /// had to decode as a String first.
+    private static func splitHeadersAndBody(_ data: Data) -> (String, Data) {
+        let bytes = [UInt8](data)
+        let crlf = firstIndex(of: [0x0D, 0x0A, 0x0D, 0x0A], in: bytes, from: 0)
+        let lf = firstIndex(of: [0x0A, 0x0A], in: bytes, from: 0)
+
+        // Whichever blank line comes first ends the headers.
+        let separator: (start: Int, length: Int)?
+        switch (crlf, lf) {
+        case let (c?, l?): separator = c <= l ? (c, 4) : (l, 2)
+        case let (c?, nil): separator = (c, 4)
+        case let (nil, l?): separator = (l, 2)
+        case (nil, nil): separator = nil
         }
 
-        // No body — entire content is headers
-        return (string, Data())
+        guard let separator else {
+            // No body — entire content is headers
+            return (headerString(bytes[...]), Data())
+        }
+        return (
+            headerString(bytes[..<separator.start]),
+            Data(bytes[(separator.start + separator.length)...])
+        )
+    }
+
+    /// Header bytes as text: UTF-8 (RFC 6532), else Latin-1, which maps every
+    /// byte and so never fails on a stray 8-bit header.
+    private static func headerString(_ bytes: ArraySlice<UInt8>) -> String {
+        String(bytes: bytes, encoding: .utf8) ?? String(bytes: bytes, encoding: .isoLatin1) ?? ""
+    }
+
+    /// The first index at or after `start` where `needle` occurs in `haystack`.
+    private static func firstIndex(of needle: [UInt8], in haystack: [UInt8], from start: Int) -> Int? {
+        guard !needle.isEmpty, haystack.count >= needle.count, start <= haystack.count - needle.count else {
+            return nil
+        }
+        let first = needle[0]
+        var index = start
+        let last = haystack.count - needle.count
+        while index <= last {
+            if haystack[index] == first {
+                var matched = true
+                for offset in 1..<needle.count where haystack[index + offset] != needle[offset] {
+                    matched = false
+                    break
+                }
+                if matched { return index }
+            }
+            index += 1
+        }
+        return nil
     }
 
     /// Parse an RFC 5322 header block into key-value pairs.
@@ -163,9 +206,18 @@ public struct EMLParser {
 
         let date = headers["date"].flatMap { parseRFC2822Date($0) }
 
+        // Threading: replies need both, and they were left behind.
+        let inReplyTo = headers["in-reply-to"].flatMap { value in
+            value.split(whereSeparator: \.isWhitespace).first.flatMap { MessageID(String($0)) }
+        }
+        let references = headers["references"].map { value in
+            value.split(whereSeparator: \.isWhitespace).compactMap { MessageID(String($0)) }
+        }
+
         // Collect additional headers (everything except standard ones)
         let standardKeys: Set<String> = [
             "from", "to", "cc", "bcc", "subject", "date", "message-id",
+            "in-reply-to", "references",
             "content-type", "content-transfer-encoding", "mime-version"
         ]
         var additional: [String: String] = [:]
@@ -183,6 +235,8 @@ public struct EMLParser {
             bcc: bcc,
             date: date,
             messageId: messageId,
+            inReplyTo: inReplyTo,
+            references: references?.isEmpty == false ? references : nil,
             flags: [],
             parts: [],
             additionalFields: additional.isEmpty ? nil : additional
@@ -228,66 +282,7 @@ public struct EMLParser {
             )]
         }
 
-        guard let bodyString = String(data: bodyData, encoding: .utf8) ?? String(data: bodyData, encoding: .ascii) else {
-            return []
-        }
-
-        let delimiter = "--\(boundary)"
-
-        // Split the body by the boundary delimiter using range-based splitting
-        // This avoids line-by-line parsing issues across platforms
-        var rawParts: [String] = []
-        var searchStart = bodyString.startIndex
-
-        while searchStart < bodyString.endIndex {
-            // Find the next boundary
-            guard let delimRange = bodyString.range(of: delimiter, range: searchStart..<bodyString.endIndex) else {
-                break
-            }
-
-            // Check if this is the end delimiter
-            let afterDelim = delimRange.upperBound
-            if afterDelim < bodyString.endIndex {
-                let remaining = bodyString[afterDelim...]
-                if remaining.hasPrefix("--") {
-                    // End delimiter — stop
-                    break
-                }
-            }
-
-            // Find the start of part content (skip past delimiter + line ending)
-            var contentStart = afterDelim
-            if contentStart < bodyString.endIndex && bodyString[contentStart] == "\r" {
-                contentStart = bodyString.index(after: contentStart)
-            }
-            if contentStart < bodyString.endIndex && bodyString[contentStart] == "\n" {
-                contentStart = bodyString.index(after: contentStart)
-            }
-
-            // Find the next boundary to determine the end of this part
-            if let nextDelimRange = bodyString.range(of: delimiter, range: contentStart..<bodyString.endIndex) {
-                var contentEnd = nextDelimRange.lowerBound
-                // Strip trailing \r\n or \n before boundary
-                if contentEnd > contentStart {
-                    let beforeEnd = bodyString.index(before: contentEnd)
-                    if bodyString[beforeEnd] == "\n" {
-                        contentEnd = beforeEnd
-                        if contentEnd > contentStart {
-                            let beforeLF = bodyString.index(before: contentEnd)
-                            if bodyString[beforeLF] == "\r" {
-                                contentEnd = beforeLF
-                            }
-                        }
-                    }
-                }
-                rawParts.append(String(bodyString[contentStart..<contentEnd]))
-                searchStart = nextDelimRange.lowerBound
-            } else {
-                // No more boundaries — take the rest
-                rawParts.append(String(bodyString[contentStart...]).trimmingCharacters(in: .whitespacesAndNewlines))
-                break
-            }
-        }
+        let rawParts = splitMultipartBody([UInt8](bodyData), boundary: boundary)
 
         // Parse each sub-part
         var result: [MessagePart] = []
@@ -295,8 +290,7 @@ public struct EMLParser {
             let partNumber = index + 1
             let childPath = sectionPath.isEmpty ? [partNumber] : sectionPath + [partNumber]
 
-            let partData = Data(rawPart.utf8)
-            let (partHeaders, partBody) = splitHeadersAndBody(from: rawPart, rawData: partData)
+            let (partHeaders, partBody) = splitHeadersAndBody(rawPart)
             let headers = parseHeaders(partHeaders)
 
             let partContentType = headers["content-type"] ?? "text/plain"
@@ -325,6 +319,57 @@ public struct EMLParser {
         }
 
         return result
+    }
+
+    /// The body parts of a multipart entity, as bytes, between its boundaries.
+    ///
+    /// A delimiter counts only at the start of a line (RFC 2046 §5.1.1), and
+    /// the line break before it belongs to the delimiter, not to the part.
+    /// Byte offsets throughout, for the reason given at `splitHeadersAndBody`.
+    static func splitMultipartBody(_ bytes: [UInt8], boundary: String) -> [Data] {
+        let delimiter = Array("--\(boundary)".utf8)
+        let cr: UInt8 = 0x0D, lf: UInt8 = 0x0A, dash: UInt8 = 0x2D
+
+        // Every delimiter that starts a line.
+        var delimiters: [Int] = []
+        var searchFrom = 0
+        while let found = firstIndex(of: delimiter, in: bytes, from: searchFrom) {
+            if found == 0 || bytes[found - 1] == lf { delimiters.append(found) }
+            searchFrom = found + delimiter.count
+        }
+
+        var parts: [Data] = []
+        for (position, start) in delimiters.enumerated() {
+            let afterDelimiter = start + delimiter.count
+            // The close delimiter ends the multipart; what follows is epilogue.
+            if afterDelimiter + 1 < bytes.count, bytes[afterDelimiter] == dash, bytes[afterDelimiter + 1] == dash {
+                break
+            }
+            // Skip transport padding and the line break after the delimiter.
+            var contentStart = afterDelimiter
+            while contentStart < bytes.count, bytes[contentStart] == 0x20 || bytes[contentStart] == 0x09 {
+                contentStart += 1
+            }
+            if contentStart < bytes.count, bytes[contentStart] == cr { contentStart += 1 }
+            if contentStart < bytes.count, bytes[contentStart] == lf { contentStart += 1 }
+
+            if position + 1 < delimiters.count {
+                var contentEnd = delimiters[position + 1]
+                if contentEnd > contentStart, bytes[contentEnd - 1] == lf {
+                    contentEnd -= 1
+                    if contentEnd > contentStart, bytes[contentEnd - 1] == cr { contentEnd -= 1 }
+                }
+                parts.append(Data(bytes[contentStart..<max(contentStart, contentEnd)]))
+            } else {
+                // No close delimiter: the rest is the last part.
+                var contentEnd = bytes.count
+                while contentEnd > contentStart, bytes[contentEnd - 1] == cr || bytes[contentEnd - 1] == lf {
+                    contentEnd -= 1
+                }
+                parts.append(Data(bytes[contentStart..<contentEnd]))
+            }
+        }
+        return parts
     }
 
     // MARK: - Header Parameter Extraction
